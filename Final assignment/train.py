@@ -19,12 +19,32 @@ from utils import convert_to_train_id, convert_train_id_to_color, compose_predic
 
 from argparse import ArgumentParser
 
+class EnsembleModel(nn.Module):
+    """
+    A single PyTorch model that contains the small, medium, and big submodels.
+    During forward, it returns all three logits (or you can do composition).
+    """
+    def __init__(self, device='cpu'):
+        super().__init__()
+        # Instantiate each submodel on CPU or GPU as needed
+        self.model_small = get_small_model(device=device)
+        self.model_medium = get_medium_model(device=device)
+        self.model_big = get_big_model(device=device)
+
+    def forward(self, x):
+        # We simply forward through each submodel and return all three results
+        out_small = self.model_small(x)
+        out_medium = self.model_medium(x)
+        out_big = self.model_big(x)
+        return out_small, out_medium, out_big
+
+
 def get_args_parser():
     parser = ArgumentParser("Training script for multiple models (small/medium/big).")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to Cityscapes data")
-    parser.add_argument("--batch-size", type=int, default=1, help="Training batch size")
+    parser.add_argument("--batch-size", type=int, default=128, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader num_workers")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
@@ -90,6 +110,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     best_val_loss = float("inf")
+    best_checkpoint_path = None  # To remember the path of the best checkpoint
 
     for epoch in range(args.epochs):
         print(f"Epoch [{epoch+1}/{args.epochs}]")
@@ -102,6 +123,7 @@ def main(args):
         train_losses_medium = []
         train_losses_big = []
 
+        # ------------------ TRAINING LOOP ------------------
         for images, labels in train_dataloader:
             images = images.to(device)
             # Convert official IDs to train IDs, then remap to small/medium/big label sets
@@ -126,7 +148,6 @@ def main(args):
             labels_medium = remap_medium(labels_trainid).long().squeeze(1).to(device)
             optimizer_medium.zero_grad()
             out_medium = model_medium(images)  # shape [B, 5, H..., W...]
-            # You may need to interpolate if the output is not the same spatial size:
             out_medium_upsampled = F.interpolate(
                 out_medium,
                 size=labels_medium.shape[-2:],
@@ -158,6 +179,7 @@ def main(args):
         avg_loss_medium = sum(train_losses_medium) / len(train_losses_medium)
         avg_loss_big = sum(train_losses_big) / len(train_losses_big)
 
+        # ------------------ VALIDATION LOOP ------------------
         model_small.eval()
         model_medium.eval()
         model_big.eval()
@@ -184,6 +206,7 @@ def main(args):
                 )
                 loss_small = criterion(out_small_upsampled, labels_small)
                 val_losses_small.append(loss_small.item())
+                pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)
 
                 # ---- Medium model ----
                 labels_medium = remap_medium(labels_trainid).long().squeeze(1).to(device)
@@ -196,6 +219,7 @@ def main(args):
                 )
                 loss_medium = criterion(out_medium_upsampled, labels_medium)
                 val_losses_medium.append(loss_medium.item())
+                pred_medium = out_medium_upsampled.softmax(dim=1).argmax(dim=1)
 
                 # ---- Big model ----
                 labels_big = remap_big(labels_trainid).long().squeeze(1).to(device)
@@ -208,21 +232,39 @@ def main(args):
                 )
                 loss_big = criterion(out_big_upsampled, labels_big)
                 val_losses_big.append(loss_big.item())
+                pred_big = out_big_upsampled.softmax(dim=1).argmax(dim=1)
 
-                # Log example predictions
+                # ---- Log example predictions (only once per epoch for efficiency) ----
                 if not logged_images:
-                    pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)
-                    pred_medium = out_medium_upsampled.softmax(dim=1).argmax(dim=1)
-                    pred_big = out_big_upsampled.softmax(dim=1).argmax(dim=1)
+                    # Convert each model's prediction to color
+                    pred_small_color = convert_train_id_to_color(pred_small.unsqueeze(1))
+                    pred_small_img = make_grid(pred_small_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
+                    pred_medium_color = convert_train_id_to_color(pred_medium.unsqueeze(1))
+                    pred_medium_img = make_grid(pred_medium_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
+                    pred_big_color = convert_train_id_to_color(pred_big.unsqueeze(1))
+                    pred_big_img = make_grid(pred_big_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
                     # Compose predictions if you like
                     composed_pred = compose_predictions(pred_small, pred_medium, pred_big, ignore_index=255)
                     composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
-                    composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4)
-                    composed_pred_img = composed_pred_img.permute(1, 2, 0).numpy()
+                    composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
+                    # Also log ground truth (color-coded)
+                    gt_color = convert_train_id_to_color(labels_trainid)  # shape [B,3,H,W]
+                    gt_img = make_grid(gt_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
+                    # Optionally, only log images every 5 epochs or so to reduce clutter
                     if epoch % 5 == 0:
-                        wandb.log({"val_composed_prediction": [wandb.Image(composed_pred_img)]})
+                        wandb.log({
+                            "val_small_prediction": [wandb.Image(pred_small_img)],
+                            "val_medium_prediction": [wandb.Image(pred_medium_img)],
+                            "val_big_prediction": [wandb.Image(pred_big_img)],
+                            "val_composed_prediction": [wandb.Image(composed_pred_img)],
+                            "val_ground_truth": [wandb.Image(gt_img)]
+                        })
+
                     logged_images = True
 
         # Average validation losses
@@ -231,7 +273,7 @@ def main(args):
         avg_val_big = sum(val_losses_big) / len(val_losses_big) if val_losses_big else 0
         val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0
 
-        # Log to W&B
+        # ------------------ LOGGING & CHECKPOINTING ------------------
         wandb.log({
             "train_loss_small": avg_loss_small,
             "train_loss_medium": avg_loss_medium,
@@ -243,15 +285,39 @@ def main(args):
         # Save best model checkpoint
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            checkpoint_name = f"best_models_epoch={epoch+1}_val={val_loss:.4f}.pth"
+            best_checkpoint_path = os.path.join("checkpoints", checkpoint_name)
+
             torch.save({
                 "model_small": model_small.state_dict(),
                 "model_medium": model_medium.state_dict(),
                 "model_big": model_big.state_dict(),
-            }, os.path.join("checkpoints", f"best_models_epoch={epoch+1}_val={val_loss:.4f}.pth"))
+            }, best_checkpoint_path)
+
             print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
+            
+            # --------------------------------------------------------------
+            # 3) Build single-file ensemble checkpoint right after saving
+            # --------------------------------------------------------------
+            print("-> Building single-file ensemble checkpoint...")
+            # Create an ensemble model on CPU (or device if you wish)
+            ensemble = EnsembleModel(device="cpu")
+
+            # Load each submodel’s weights
+            checkpoint_dict = torch.load(best_checkpoint_path, map_location="cpu")
+            ensemble.model_small.load_state_dict(checkpoint_dict["model_small"])
+            ensemble.model_medium.load_state_dict(checkpoint_dict["model_medium"])
+            ensemble.model_big.load_state_dict(checkpoint_dict["model_big"])
+
+            # Now save the entire ensemble’s state_dict as ONE file
+            ensemble_path = os.path.join("checkpoints", f"best_ensemble_epoch={epoch+1}_val={val_loss:.4f}.pth")
+            torch.save(ensemble.state_dict(), ensemble_path)
+
+            print(f"-> Single-file ensemble saved: {ensemble_path}")
 
     wandb.finish()
     print("Training complete.")
+
 
 if __name__ == "__main__":
     parser = get_args_parser()
