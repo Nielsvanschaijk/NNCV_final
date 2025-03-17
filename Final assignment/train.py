@@ -12,9 +12,22 @@ from torchvision.datasets import Cityscapes, wrap_dataset_for_transforms_v2
 from torchvision.transforms.v2 import Compose, Normalize, Resize, ToImage, ToDtype
 from torchvision.utils import make_grid
 
-from models.Model_small import get_model as get_small_model, remap_label_small as remap_small
-from models.Model_medium import get_model as get_medium_model, remap_label_medium as remap_medium
-from models.Model_big import get_model as get_big_model, remap_label_big as remap_big
+from models.Model_small import (
+    get_model as get_small_model,
+    remap_label_small as remap_small,
+    decode_label_small
+)
+from models.Model_medium import (
+    get_model as get_medium_model,
+    remap_label_medium as remap_medium,
+    decode_label_medium
+)
+from models.Model_big import (
+    get_model as get_big_model,
+    remap_label_big as remap_big,
+    decode_label_big
+)
+
 from utils import convert_to_train_id, convert_train_id_to_color, compose_predictions
 
 from argparse import ArgumentParser
@@ -50,7 +63,10 @@ def get_args_parser():
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
     return parser
 
-def update_confusion_matrix(conf_mat: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, ignore_index=255) -> torch.Tensor:
+def update_confusion_matrix(conf_mat: torch.Tensor, 
+                            pred: torch.Tensor, 
+                            target: torch.Tensor, 
+                            ignore_index=255) -> torch.Tensor:
     """
     Updates the provided confusion matrix (conf_mat) given the current batch of
     predictions (pred) and ground-truth labels (target).
@@ -63,7 +79,12 @@ def update_confusion_matrix(conf_mat: torch.Tensor, pred: torch.Tensor, target: 
 
     Returns:
         Updated conf_mat in-place (also returned for convenience).
+        NOTE: The returned `conf_mat` is now on the same device as `pred`.
     """
+    # Make sure conf_mat is on the same device as pred
+    if conf_mat.device != pred.device:
+        conf_mat = conf_mat.to(pred.device)
+
     # Flatten for simplicity
     pred = pred.view(-1)
     target = target.view(-1)
@@ -75,8 +96,8 @@ def update_confusion_matrix(conf_mat: torch.Tensor, pred: torch.Tensor, target: 
 
     # Now accumulate counts into confusion matrix
     indices = target * conf_mat.shape[0] + pred
-    # bincount the pairs (gt, pred)
     conf_mat += torch.bincount(indices, minlength=conf_mat.numel()).view(conf_mat.size())
+
     return conf_mat
 
 
@@ -127,7 +148,7 @@ def main(args):
     # Transforms
     transform = Compose([
         ToImage(),
-        Resize((256, 256)),
+        Resize((512, 512)),
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])
@@ -144,10 +165,10 @@ def main(args):
     # Create checkpoint directory
     os.makedirs("checkpoints", exist_ok=True)
 
-    # Initialize models (ensure they have correct num_classes)
-    model_small = get_small_model(device)    # should have output channels = 8
-    model_medium = get_medium_model(device)  # should have output channels = 5
-    model_big = get_big_model(device)        # should have output channels = 9
+    # Initialize models
+    model_small = get_small_model(device)    # 8 output channels
+    model_medium = get_medium_model(device)  # 5 output channels
+    model_big = get_big_model(device)        # 9 output channels
 
     # Define optimizers
     optimizer_small = AdamW(model_small.parameters(), lr=args.lr)
@@ -158,7 +179,7 @@ def main(args):
     criterion = nn.CrossEntropyLoss(ignore_index=255)
 
     best_val_loss = float("inf")
-    best_checkpoint_path = None  # To remember the path of the best checkpoint
+    best_checkpoint_path = None
 
     for epoch in range(args.epochs):
         print(f"Epoch [{epoch+1}/{args.epochs}]")
@@ -174,13 +195,13 @@ def main(args):
         # ------------------ TRAINING LOOP ------------------
         for images, labels in train_dataloader:
             images = images.to(device)
-            # Convert official IDs to train IDs, then remap to small/medium/big label sets
+            # Convert official IDs to train IDs, then remap to small/medium/big
             labels_trainid = convert_to_train_id(labels)
 
             # ---- Small model ----
             labels_small = remap_small(labels_trainid).long().squeeze(1).to(device)
             optimizer_small.zero_grad()
-            out_small = model_small(images)  # shape [B, 8, H/..., W/...]
+            out_small = model_small(images)  # shape [B,8,H,W]
             out_small_upsampled = F.interpolate(
                 out_small,
                 size=labels_small.shape[-2:],  # match label resolution
@@ -195,7 +216,7 @@ def main(args):
             # ---- Medium model ----
             labels_medium = remap_medium(labels_trainid).long().squeeze(1).to(device)
             optimizer_medium.zero_grad()
-            out_medium = model_medium(images)  # shape [B, 5, H..., W...]
+            out_medium = model_medium(images)  # shape [B,5,H,W]
             out_medium_upsampled = F.interpolate(
                 out_medium,
                 size=labels_medium.shape[-2:],
@@ -210,7 +231,7 @@ def main(args):
             # ---- Big model ----
             labels_big = remap_big(labels_trainid).long().squeeze(1).to(device)
             optimizer_big.zero_grad()
-            out_big = model_big(images)  # shape [B, 9, H..., W...]
+            out_big = model_big(images)  # shape [B,9,H,W]
             out_big_upsampled = F.interpolate(
                 out_big,
                 size=labels_big.shape[-2:],
@@ -236,13 +257,11 @@ def main(args):
         val_losses_medium = []
         val_losses_big = []
 
-        # Create confusion matrices for each model & the composed model
-        # (Adjust num_classes_xxxx to match your label sets!)
-        num_classes_small = 8   # or out_small.shape[1]
-        num_classes_medium = 5  # or out_medium.shape[1]
-        num_classes_big = 9     # or out_big.shape[1]
-        num_classes_composed = 19  # e.g., if your final composed predictions are in [0..18], ignoring 255
-
+        # For confusion matrices
+        num_classes_small = 8   # sub-model classes
+        num_classes_medium = 5
+        num_classes_big = 9
+        num_classes_composed = 19  # if compose outputs [0..18]
         conf_mat_small = torch.zeros(num_classes_small, num_classes_small, dtype=torch.int64)
         conf_mat_medium = torch.zeros(num_classes_medium, num_classes_medium, dtype=torch.int64)
         conf_mat_big = torch.zeros(num_classes_big, num_classes_big, dtype=torch.int64)
@@ -254,86 +273,87 @@ def main(args):
             for i, (images, labels) in enumerate(valid_dataloader):
                 images = images.to(device)
 
-                # Convert official IDs to train IDs, ignoring =255
+                # Convert official IDs to train IDs
                 labels_trainid = convert_to_train_id(labels)  # shape [B,1,H,W]
-                
-                # --------------- SMALL MODEL ---------------
-                labels_small = remap_small(labels_trainid).long().squeeze(1).to(device)  # shape [B,H,W]
+
+                # --------- SMALL MODEL ---------
+                labels_small = remap_small(labels_trainid).long().squeeze(1).to(device)
                 out_small = model_small(images)
                 out_small_upsampled = F.interpolate(
-                    out_small, size=labels_small.shape[-2:], mode='bilinear', align_corners=True
+                    out_small,
+                    size=labels_small.shape[-2:],
+                    mode='bilinear',
+                    align_corners=True
                 )
                 loss_small = criterion(out_small_upsampled, labels_small)
                 val_losses_small.append(loss_small.item())
-                # Predictions
-                pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)  # shape [B,H,W]
-
-                # Update confusion matrix (small)
+                pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)  # [B,H,W]
                 conf_mat_small = update_confusion_matrix(conf_mat_small, pred_small, labels_small, ignore_index=255)
 
-                # --------------- MEDIUM MODEL ---------------
+                # --------- MEDIUM MODEL ---------
                 labels_medium = remap_medium(labels_trainid).long().squeeze(1).to(device)
                 out_medium = model_medium(images)
                 out_medium_upsampled = F.interpolate(
-                    out_medium, size=labels_medium.shape[-2:], mode='bilinear', align_corners=True
+                    out_medium,
+                    size=labels_medium.shape[-2:],
+                    mode='bilinear',
+                    align_corners=True
                 )
                 loss_medium = criterion(out_medium_upsampled, labels_medium)
                 val_losses_medium.append(loss_medium.item())
                 pred_medium = out_medium_upsampled.softmax(dim=1).argmax(dim=1)
-
-                # Update confusion matrix (medium)
                 conf_mat_medium = update_confusion_matrix(conf_mat_medium, pred_medium, labels_medium, ignore_index=255)
 
-                # --------------- BIG MODEL ---------------
+                # --------- BIG MODEL ---------
                 labels_big = remap_big(labels_trainid).long().squeeze(1).to(device)
                 out_big = model_big(images)
                 out_big_upsampled = F.interpolate(
-                    out_big, size=labels_big.shape[-2:], mode='bilinear', align_corners=True
+                    out_big,
+                    size=labels_big.shape[-2:],
+                    mode='bilinear',
+                    align_corners=True
                 )
                 loss_big = criterion(out_big_upsampled, labels_big)
                 val_losses_big.append(loss_big.item())
                 pred_big = out_big_upsampled.softmax(dim=1).argmax(dim=1)
-
-                # Update confusion matrix (big)
                 conf_mat_big = update_confusion_matrix(conf_mat_big, pred_big, labels_big, ignore_index=255)
 
-                # --------------- COMPOSED MODEL ---------------
-                # (Assuming the final composed predictions are in [0..18], ignoring 255)
-                composed_pred = compose_predictions(pred_small, pred_medium, pred_big,
-                                                    bg_small=0, bg_medium=0, bg_big=0)
-                # Here, the "composed_pred" can be matched against labels_trainid 
-                # if that is in the correct [0..18, 255] range
-                # (Often you want to check that your compose_predictions() 
-                #  indeed outputs the same ID scheme as the Cityscapes train IDs.)
-                
-                # Update confusion matrix (composed)
-                # If `composed_pred` is shape [B,H,W] in [0..18],
-                # and labels_trainid is shape [B,1,H,W] in [0..18,255],
-                # we can do:
+                # --------- COMPOSED MODEL ---------
+                composed_pred = compose_predictions(
+                    pred_small, pred_medium, pred_big,
+                    bg_small=0, bg_medium=0, bg_big=0
+                )
                 ground_truth_full = labels_trainid.squeeze(1).to(device)
                 conf_mat_composed = update_confusion_matrix(
                     conf_mat_composed, composed_pred, ground_truth_full, ignore_index=255
                 )
 
-                # ---- Log example predictions (only once per epoch for efficiency) ----
+                # --------- LOG IMAGES (ONCE PER EPOCH) ---------
                 if not logged_images:
-                    # Convert each model's prediction to color
-                    pred_small_color = convert_train_id_to_color(pred_small.unsqueeze(1))
+                    # 1) Decode sub-model predictions to Cityscapes IDs
+                    decoded_small = decode_label_small(pred_small)    # shape [B,H,W], 0..18
+                    decoded_medium = decode_label_medium(pred_medium) # shape [B,H,W], 0..18
+                    decoded_big = decode_label_big(pred_big)          # shape [B,H,W], 0..18
+
+                    # If compose_predictions already yields 0..18, we can color it directly
+                    composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
+                    composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1,2,0).numpy()
+
+                    # 2) Convert each decoded mask to color
+                    pred_small_color = convert_train_id_to_color(decoded_small.unsqueeze(1))
                     pred_small_img = make_grid(pred_small_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    pred_medium_color = convert_train_id_to_color(pred_medium.unsqueeze(1))
+                    pred_medium_color = convert_train_id_to_color(decoded_medium.unsqueeze(1))
                     pred_medium_img = make_grid(pred_medium_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    pred_big_color = convert_train_id_to_color(pred_big.unsqueeze(1))
+                    pred_big_color = convert_train_id_to_color(decoded_big.unsqueeze(1))
                     pred_big_img = make_grid(pred_big_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
-                    composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
-
-                    gt_color = convert_train_id_to_color(labels_trainid)  # shape [B,3,H,W]
+                    # 3) Convert ground truth (train IDs) to color
+                    gt_color = convert_train_id_to_color(labels_trainid)  # [B,3,H,W]
                     gt_img = make_grid(gt_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    # Optionally, only log images every 5 epochs or so
+                    # Log to wandb
                     if epoch % 5 == 0:
                         wandb.log({
                             "val_small_prediction": [wandb.Image(pred_small_img)],
@@ -344,21 +364,21 @@ def main(args):
                         })
 
                     logged_images = True
+                # --------- END validation batch loop ---------
 
-
-                # --------------- END of validation loop ---------------
+        # Averages
         avg_val_small = sum(val_losses_small) / len(val_losses_small) if val_losses_small else 0
         avg_val_medium = sum(val_losses_medium) / len(val_losses_medium) if val_losses_medium else 0
         avg_val_big = sum(val_losses_big) / len(val_losses_big) if val_losses_big else 0
         val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0
 
-        # Compute mIoU for each model and for the composed
+        # Compute mIoU in sub-model space
         miou_small = compute_miou(conf_mat_small)
         miou_medium = compute_miou(conf_mat_medium)
         miou_big = compute_miou(conf_mat_big)
         miou_composed = compute_miou(conf_mat_composed)
 
-        # Log everything to wandb
+        # Log metrics
         wandb.log({
             "train_loss_small": avg_loss_small,
             "train_loss_medium": avg_loss_medium,
@@ -385,11 +405,8 @@ def main(args):
 
             print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
             
-            # --------------------------------------------------------------
-            # 3) Build single-file ensemble checkpoint right after saving
-            # --------------------------------------------------------------
+            # 3) Build single-file ensemble checkpoint
             print("-> Building single-file ensemble checkpoint...")
-            # Create an ensemble model on CPU (or device if you wish)
             ensemble = EnsembleModel(device="cpu")
 
             # Load each submodel’s weights
@@ -398,7 +415,7 @@ def main(args):
             ensemble.model_medium.load_state_dict(checkpoint_dict["model_medium"])
             ensemble.model_big.load_state_dict(checkpoint_dict["model_big"])
 
-            # Now save the entire ensemble’s state_dict as ONE file
+            # Save entire ensemble’s state_dict as ONE file
             ensemble_path = os.path.join("checkpoints", f"best_ensemble_epoch={epoch+1}_val={val_loss:.4f}.pth")
             torch.save(ensemble.state_dict(), ensemble_path)
 

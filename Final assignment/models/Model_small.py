@@ -45,3 +45,31 @@ def remap_label_small(mask, ignore_index=255):
     # Keep originally ignored pixels (255) as 255
     new_mask[mask == 255] = ignore_index
     return new_mask
+
+def decode_label_small(pred, ignore_index=255):
+    """
+    'pred' is the output from the Small model, where:
+        0 -> background
+        1 -> pole           (Cityscapes trainID=5)
+        2 -> traffic light  (6)
+        3 -> traffic sign   (7)
+        4 -> person         (11)
+        5 -> rider          (12)
+        6 -> motorcycle     (17)
+        7 -> bicycle        (18)
+    """
+    new_pred = torch.full_like(pred, ignore_index)
+
+    class_mapping = {
+        1: 5,   # pole
+        2: 6,   # traffic light
+        3: 7,   # traffic sign
+        4: 11,  # person
+        5: 12,  # rider
+        6: 17,  # motorcycle
+        7: 18,  # bicycle
+    }
+    for sub_id, city_id in class_mapping.items():
+        new_pred[pred == sub_id] = city_id
+
+    return new_pred
