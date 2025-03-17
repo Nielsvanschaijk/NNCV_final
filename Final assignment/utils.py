@@ -25,17 +25,24 @@ def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
             color_image[:, i][mask] = color[i]
     return color_image
 
-def compose_predictions(pred_small, pred_medium, pred_big, ignore_index=255):
+def compose_predictions(pred_small, pred_medium, pred_big, bg_small=0, bg_medium=0, bg_big=0):
     """
-    Combine the three predictions so that:
-      small > medium > big > background.
-    Each prediction has shape (B, H, W). Returns a composed prediction (B, H, W).
+    Overwrite logic: 
+    1) If small != bg_small, use small’s class.
+    2) Else if medium != bg_medium, use medium’s class.
+    3) Else if big != bg_big, use big’s class.
+    Otherwise remain background.
     """
-    final = torch.full_like(pred_small, fill_value=ignore_index)
-    mask_small = (pred_small != ignore_index)
-    final[mask_small] = pred_small[mask_small]
-    mask_medium = (final == ignore_index) & (pred_medium != ignore_index)
-    final[mask_medium] = pred_medium[mask_medium]
-    mask_big = (final == ignore_index) & (pred_big != ignore_index)
-    final[mask_big] = pred_big[mask_big]
+    # Start from small’s predictions
+    final = pred_small.clone()
+
+    # Where small is background, try medium
+    small_bg_mask = (pred_small == bg_small)
+    # Overwrite only where medium is non-bg
+    final[small_bg_mask & (pred_medium != bg_medium)] = pred_medium[small_bg_mask & (pred_medium != bg_medium)]
+
+    # Where final is still background, try big
+    final_bg_mask = (final == bg_small)
+    final[final_bg_mask & (pred_big != bg_big)] = pred_big[final_bg_mask & (pred_big != bg_big)]
+
     return final
