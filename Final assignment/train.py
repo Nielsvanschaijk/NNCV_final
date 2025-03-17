@@ -50,6 +50,54 @@ def get_args_parser():
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
     return parser
 
+def update_confusion_matrix(conf_mat: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, ignore_index=255) -> torch.Tensor:
+    """
+    Updates the provided confusion matrix (conf_mat) given the current batch of
+    predictions (pred) and ground-truth labels (target).
+
+    Args:
+        conf_mat:       shape [num_classes, num_classes], int64
+        pred:           shape [B,H,W], predictions in [0..num_classes-1]
+        target:         shape [B,H,W], ground-truth in [0..num_classes-1 or ignore_index]
+        ignore_index:   label to ignore from evaluation (e.g. 255)
+
+    Returns:
+        Updated conf_mat in-place (also returned for convenience).
+    """
+    # Flatten for simplicity
+    pred = pred.view(-1)
+    target = target.view(-1)
+
+    # Filter out ignore_index
+    valid_mask = (target != ignore_index)
+    pred = pred[valid_mask]
+    target = target[valid_mask]
+
+    # Now accumulate counts into confusion matrix
+    indices = target * conf_mat.shape[0] + pred
+    # bincount the pairs (gt, pred)
+    conf_mat += torch.bincount(indices, minlength=conf_mat.numel()).view(conf_mat.size())
+    return conf_mat
+
+
+def compute_miou(conf_mat: torch.Tensor) -> float:
+    """
+    Computes the mean IoU from the provided confusion matrix.
+    Ignores any class that has 0 pixels total.
+    """
+    # The diagonal is intersection
+    intersection = torch.diag(conf_mat)
+    # For each row (class), the row sum is the total GT for that class
+    # For each column (class), the column sum is the total predictions
+    gt_plus_pred = conf_mat.sum(dim=1) + conf_mat.sum(dim=0) - intersection  # denominator for IoU
+
+    # Avoid division by zero
+    valid_mask = (gt_plus_pred > 0)
+    iou_per_class = torch.zeros_like(intersection, dtype=torch.float)
+    iou_per_class[valid_mask] = intersection[valid_mask].float() / gt_plus_pred[valid_mask].float()
+
+    # Mean over valid classes
+    return iou_per_class.mean().item()
 
 def main(args):
     print(f"Checking dataset path: {args.data_dir}")
@@ -188,51 +236,84 @@ def main(args):
         val_losses_medium = []
         val_losses_big = []
 
+        # Create confusion matrices for each model & the composed model
+        # (Adjust num_classes_xxxx to match your label sets!)
+        num_classes_small = 8   # or out_small.shape[1]
+        num_classes_medium = 5  # or out_medium.shape[1]
+        num_classes_big = 9     # or out_big.shape[1]
+        num_classes_composed = 19  # e.g., if your final composed predictions are in [0..18], ignoring 255
+
+        conf_mat_small = torch.zeros(num_classes_small, num_classes_small, dtype=torch.int64)
+        conf_mat_medium = torch.zeros(num_classes_medium, num_classes_medium, dtype=torch.int64)
+        conf_mat_big = torch.zeros(num_classes_big, num_classes_big, dtype=torch.int64)
+        conf_mat_composed = torch.zeros(num_classes_composed, num_classes_composed, dtype=torch.int64)
+
         logged_images = False
 
         with torch.no_grad():
             for i, (images, labels) in enumerate(valid_dataloader):
                 images = images.to(device)
-                labels_trainid = convert_to_train_id(labels)
 
-                # ---- Small model ----
-                labels_small = remap_small(labels_trainid).long().squeeze(1).to(device)
+                # Convert official IDs to train IDs, ignoring =255
+                labels_trainid = convert_to_train_id(labels)  # shape [B,1,H,W]
+                
+                # --------------- SMALL MODEL ---------------
+                labels_small = remap_small(labels_trainid).long().squeeze(1).to(device)  # shape [B,H,W]
                 out_small = model_small(images)
                 out_small_upsampled = F.interpolate(
-                    out_small,
-                    size=labels_small.shape[-2:],
-                    mode='bilinear',
-                    align_corners=True
+                    out_small, size=labels_small.shape[-2:], mode='bilinear', align_corners=True
                 )
                 loss_small = criterion(out_small_upsampled, labels_small)
                 val_losses_small.append(loss_small.item())
-                pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)
+                # Predictions
+                pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)  # shape [B,H,W]
 
-                # ---- Medium model ----
+                # Update confusion matrix (small)
+                conf_mat_small = update_confusion_matrix(conf_mat_small, pred_small, labels_small, ignore_index=255)
+
+                # --------------- MEDIUM MODEL ---------------
                 labels_medium = remap_medium(labels_trainid).long().squeeze(1).to(device)
                 out_medium = model_medium(images)
                 out_medium_upsampled = F.interpolate(
-                    out_medium,
-                    size=labels_medium.shape[-2:],
-                    mode='bilinear',
-                    align_corners=True
+                    out_medium, size=labels_medium.shape[-2:], mode='bilinear', align_corners=True
                 )
                 loss_medium = criterion(out_medium_upsampled, labels_medium)
                 val_losses_medium.append(loss_medium.item())
                 pred_medium = out_medium_upsampled.softmax(dim=1).argmax(dim=1)
 
-                # ---- Big model ----
+                # Update confusion matrix (medium)
+                conf_mat_medium = update_confusion_matrix(conf_mat_medium, pred_medium, labels_medium, ignore_index=255)
+
+                # --------------- BIG MODEL ---------------
                 labels_big = remap_big(labels_trainid).long().squeeze(1).to(device)
                 out_big = model_big(images)
                 out_big_upsampled = F.interpolate(
-                    out_big,
-                    size=labels_big.shape[-2:],
-                    mode='bilinear',
-                    align_corners=True
+                    out_big, size=labels_big.shape[-2:], mode='bilinear', align_corners=True
                 )
                 loss_big = criterion(out_big_upsampled, labels_big)
                 val_losses_big.append(loss_big.item())
                 pred_big = out_big_upsampled.softmax(dim=1).argmax(dim=1)
+
+                # Update confusion matrix (big)
+                conf_mat_big = update_confusion_matrix(conf_mat_big, pred_big, labels_big, ignore_index=255)
+
+                # --------------- COMPOSED MODEL ---------------
+                # (Assuming the final composed predictions are in [0..18], ignoring 255)
+                composed_pred = compose_predictions(pred_small, pred_medium, pred_big,
+                                                    bg_small=0, bg_medium=0, bg_big=0)
+                # Here, the "composed_pred" can be matched against labels_trainid 
+                # if that is in the correct [0..18, 255] range
+                # (Often you want to check that your compose_predictions() 
+                #  indeed outputs the same ID scheme as the Cityscapes train IDs.)
+                
+                # Update confusion matrix (composed)
+                # If `composed_pred` is shape [B,H,W] in [0..18],
+                # and labels_trainid is shape [B,1,H,W] in [0..18,255],
+                # we can do:
+                ground_truth_full = labels_trainid.squeeze(1).to(device)
+                conf_mat_composed = update_confusion_matrix(
+                    conf_mat_composed, composed_pred, ground_truth_full, ignore_index=255
+                )
 
                 # ---- Log example predictions (only once per epoch for efficiency) ----
                 if not logged_images:
@@ -246,16 +327,13 @@ def main(args):
                     pred_big_color = convert_train_id_to_color(pred_big.unsqueeze(1))
                     pred_big_img = make_grid(pred_big_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    # Compose predictions if you like
-                    composed_pred = compose_predictions(pred_small, pred_medium, pred_big, ignore_index=255)
                     composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
                     composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    # Also log ground truth (color-coded)
                     gt_color = convert_train_id_to_color(labels_trainid)  # shape [B,3,H,W]
                     gt_img = make_grid(gt_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
-                    # Optionally, only log images every 5 epochs or so to reduce clutter
+                    # Optionally, only log images every 5 epochs or so
                     if epoch % 5 == 0:
                         wandb.log({
                             "val_small_prediction": [wandb.Image(pred_small_img)],
@@ -267,18 +345,29 @@ def main(args):
 
                     logged_images = True
 
-        # Average validation losses
+
+                # --------------- END of validation loop ---------------
         avg_val_small = sum(val_losses_small) / len(val_losses_small) if val_losses_small else 0
         avg_val_medium = sum(val_losses_medium) / len(val_losses_medium) if val_losses_medium else 0
         avg_val_big = sum(val_losses_big) / len(val_losses_big) if val_losses_big else 0
         val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0
 
-        # ------------------ LOGGING & CHECKPOINTING ------------------
+        # Compute mIoU for each model and for the composed
+        miou_small = compute_miou(conf_mat_small)
+        miou_medium = compute_miou(conf_mat_medium)
+        miou_big = compute_miou(conf_mat_big)
+        miou_composed = compute_miou(conf_mat_composed)
+
+        # Log everything to wandb
         wandb.log({
             "train_loss_small": avg_loss_small,
             "train_loss_medium": avg_loss_medium,
             "train_loss_big": avg_loss_big,
             "val_loss": val_loss,
+            "val_mIoU_small": miou_small,
+            "val_mIoU_medium": miou_medium,
+            "val_mIoU_big": miou_big,
+            "val_mIoU_composed": miou_composed,
             "epoch": epoch + 1,
         })
 
