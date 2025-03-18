@@ -3,25 +3,14 @@ import torch.nn as nn
 from network.hrnet import hrnet48
 
 def get_model(device, num_classes=8):
-    """
-    Load an HRNet-W48 model pretrained on Cityscapes (19 classes),
-    replace the final layer with one that produces 8 channels (background + 7 small classes),
-    freeze the backbone, and return the model.
-    
-    Assumptions:
-      1) 'hrnet_w48_cityscapes_cls19_1024x2048_trainset.pth' exists in the current directory.
-      2) network/hrnet.py defines hrnet48(...) which creates a model with 19-channel output.
-      3) We are targeting 7 small classes plus background.
-    """
-    # 1) Build HRNet-W48 without ImageNet or default pretrained weights
     model = hrnet48(pretrained=False, progress=False)
 
-    # 2) Load the Cityscapes checkpoint (pretrained for 19 classes)
+    # Load the Cityscapes checkpoint
     checkpoint_path = 'hrnet_w48_cityscapes_cls19_1024x2048_trainset.pth'
     state_dict = torch.load(checkpoint_path, map_location='cpu')
     model.load_state_dict(state_dict, strict=False)
 
-    # 3) Replace the final layer to output 8 channels instead of 19
+    # Replace the final layer to output 8 channels instead of 19
     if isinstance(model.last_layer, nn.Sequential) and len(model.last_layer) >= 4:
         in_channels = model.last_layer[-1].in_channels
         # Create a new Conv2d layer with 8 output channels (0: background, 1-7: small classes)
@@ -29,7 +18,7 @@ def get_model(device, num_classes=8):
     else:
         raise RuntimeError("Unexpected HRNet final layer structure. Adjust code accordingly.")
 
-    # 4) Freeze all parameters except for the new final layer
+    # Freeze all parameters except for the new final layer
     for name, param in model.named_parameters():
         if 'last_layer' in name:
             param.requires_grad = True

@@ -11,6 +11,7 @@ import wandb
 from torchvision.datasets import Cityscapes, wrap_dataset_for_transforms_v2
 from torchvision.transforms.v2 import Compose, Normalize, Resize, ToImage, ToDtype
 from torchvision.utils import make_grid
+from torchvision.transforms.v2 import InterpolationMode
 
 from models.Model_small import (
     get_model as get_small_model,
@@ -62,6 +63,21 @@ def get_args_parser():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--experiment-id", type=str, default="unet-training", help="Experiment ID for Weights & Biases")
     return parser
+
+class CityscapesWrapper(torch.utils.data.Dataset):
+    def __init__(self, base_dataset, image_transform, label_transform):
+        self.base_dataset = base_dataset
+        self.image_transform = image_transform
+        self.label_transform = label_transform
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.base_dataset[idx]
+        image = self.image_transform(image)
+        label = self.label_transform(label)
+        return image, label
 
 def update_confusion_matrix(conf_mat: torch.Tensor, 
                             pred: torch.Tensor, 
@@ -145,19 +161,30 @@ def main(args):
         reinit=True,
     )
 
-    # Transforms
-    transform = Compose([
+    image_transform = Compose([
         ToImage(),
-        Resize((512, 512)),
+        Resize((512, 512), interpolation=InterpolationMode.BILINEAR),
         ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
+        Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),  # assuming RGB images
     ])
 
-    # Datasets and dataloaders
-    train_dataset = Cityscapes(args.data_dir, split="train", mode="fine", target_type="semantic", transforms=transform)
-    valid_dataset = Cityscapes(args.data_dir, split="val", mode="fine", target_type="semantic", transforms=transform)
-    train_dataset = wrap_dataset_for_transforms_v2(train_dataset)
-    valid_dataset = wrap_dataset_for_transforms_v2(valid_dataset)
+    label_transform = Compose([
+        ToImage(),
+        Resize((512, 512), interpolation=InterpolationMode.NEAREST),
+        ToDtype(torch.int64),  # keep the labels as integers
+    ])
+
+    # Initialize the base datasets without transforms
+    base_train_dataset = Cityscapes(args.data_dir, split="train", mode="fine", target_type="semantic")
+    base_valid_dataset = Cityscapes(args.data_dir, split="val", mode="fine", target_type="semantic")
+
+    # Wrap the datasets with the separate transforms
+    train_dataset = CityscapesWrapper(base_train_dataset, image_transform=image_transform, label_transform=label_transform)
+    valid_dataset = CityscapesWrapper(base_valid_dataset, image_transform=image_transform, label_transform=label_transform)
+
+    # Use the wrapped datasets directly with DataLoader
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
