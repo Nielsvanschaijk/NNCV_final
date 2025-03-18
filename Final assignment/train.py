@@ -55,7 +55,7 @@ class EnsembleModel(nn.Module):
 def get_args_parser():
     parser = ArgumentParser("Training script for multiple models (small/medium/big).")
     parser.add_argument("--data-dir", type=str, default="./data/cityscapes", help="Path to Cityscapes data")
-    parser.add_argument("--batch-size", type=int, default=128, help="Training batch size")
+    parser.add_argument("--batch-size", type=int, default=1, help="Training batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--lr", type=float, default=0.005, help="Learning rate")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader num_workers")
