@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from network.hrnet import hrnet48
+from unet import UNet
 
 def get_model(device, num_classes=19):
     """Return an instance of the UNet model for small classes."""
