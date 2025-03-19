@@ -2,30 +2,10 @@ import torch
 import torch.nn as nn
 from network.hrnet import hrnet48
 
-def get_model(device, num_classes=8):
-    model = hrnet48(pretrained=False, progress=False)
-
-    # Load the Cityscapes checkpoint
-    checkpoint_path = 'hrnet_w48_cityscapes_cls19_1024x2048_trainset.pth'
-    state_dict = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(state_dict, strict=False)
-
-    # Replace the final layer to output 8 channels instead of 19
-    if isinstance(model.last_layer, nn.Sequential) and len(model.last_layer) >= 4:
-        in_channels = model.last_layer[-1].in_channels
-        # Create a new Conv2d layer with 8 output channels (0: background, 1-7: small classes)
-        model.last_layer[-1] = nn.Conv2d(in_channels, num_classes, kernel_size=1, stride=1)
-    else:
-        raise RuntimeError("Unexpected HRNet final layer structure. Adjust code accordingly.")
-
-    # Freeze all parameters except for the new final layer
-    for name, param in model.named_parameters():
-        if 'last_layer' in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
-
-    return model.to(device)
+def get_model(device, num_classes=19):
+    """Return an instance of the UNet model for small classes."""
+    model = UNet(in_channels=3, num_classes=8).to(device)
+    return model
 
 def remap_label_small(mask, ignore_index=255):
     """
