@@ -12,9 +12,14 @@ from torchvision.transforms.v2 import Compose, Normalize, Resize, ToImage, ToDty
 from torchvision.utils import make_grid
 from torchvision.transforms.v2 import InterpolationMode
 
-# Import the dice loss functions for each model type.
-from dice_loss import multiclass_dice_loss_small, multiclass_dice_loss_medium, multiclass_dice_loss_big
+# Dice losses for each model variant
+from dice_loss import (
+    multiclass_dice_loss_small,
+    multiclass_dice_loss_medium,
+    multiclass_dice_loss_big
+)
 
+# Submodel components
 from models.Model_small import (
     get_model as get_small_model,
     remap_label_small as remap_small,
@@ -31,24 +36,28 @@ from models.Model_big import (
     decode_label_big
 )
 
-from utils import convert_to_train_id, convert_train_id_to_color, compose_predictions
+# Utility functions
+from utils import (
+    convert_to_train_id, 
+    convert_train_id_to_color, 
+    compose_predictions
+)
 
 from argparse import ArgumentParser
 
-class EnsembleModel(nn.Module):
+class Model(nn.Module):
     """
     A single PyTorch model that contains the small, medium, and big submodels.
-    During forward, it returns all three logits (or you can do composition).
+    During forward, it returns all three logits. You can also compose them externally.
     """
-    def __init__(self, device='cpu'):
+    def __init__(self):
         super().__init__()
-        # Instantiate each submodel on CPU or GPU as needed
-        self.model_small = get_small_model(device=device)
-        self.model_medium = get_medium_model(device=device)
-        self.model_big = get_big_model(device=device)
+        # Instantiate submodels on CPU by default; we will move them to GPU later in main().
+        self.model_small = get_small_model(device="cpu")   # 8 output channels
+        self.model_medium = get_medium_model(device="cpu") # 5 output channels
+        self.model_big = get_big_model(device="cpu")       # 9 output channels
 
     def forward(self, x):
-        # We simply forward through each submodel and return all three results
         out_small = self.model_small(x)
         out_medium = self.model_medium(x)
         out_big = self.model_big(x)
@@ -95,6 +104,7 @@ def compute_miou(conf_mat: torch.Tensor) -> float:
     return iou_per_class.mean().item()
 
 def main(args):
+    # Check dataset path
     print(f"Checking dataset path: {args.data_dir}")
     if os.path.exists(args.data_dir):
         print("Contents:", os.listdir(args.data_dir))
@@ -119,10 +129,10 @@ def main(args):
         reinit=True,
     )
 
-    # Transforms
+    # Define transforms
     transform = Compose([
         ToImage(),
-        Resize((16, 16)),  # Adjusted resolution for testing
+        Resize((16, 16)),  # You can adjust the resolution as needed
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])
@@ -139,18 +149,20 @@ def main(args):
     # Create checkpoint directory
     os.makedirs("checkpoints", exist_ok=True)
 
-    # Initialize models
-    model_small = get_small_model(device)    # 8 output channels (background + 7)
-    model_medium = get_medium_model(device)    # 5 output channels (background + 4)
-    model_big = get_big_model(device)          # 9 output channels (background + 8)
+    model = Model()
+    model.to(device)
 
-    # Define optimizers
+    # For convenience, separate references to each submodel
+    model_small = model.model_small
+    model_medium = model.model_medium
+    model_big = model.model_big
+
+    # Define optimizers for each submodel
     optimizer_small = AdamW(model_small.parameters(), lr=args.lr)
     optimizer_medium = AdamW(model_medium.parameters(), lr=args.lr)
     optimizer_big = AdamW(model_big.parameters(), lr=args.lr)
 
-    # We now only use dice losses.
-    # dice_weight is kept as 1.0 in case you wish to scale the loss, but here it is simply identity.
+    # We only use dice losses here
     dice_weight = 1.0
 
     best_val_loss = float("inf")
@@ -158,6 +170,7 @@ def main(args):
 
     for epoch in range(args.epochs):
         print(f"Epoch [{epoch+1}/{args.epochs}]")
+
         model_small.train()
         model_medium.train()
         model_big.train()
@@ -227,13 +240,14 @@ def main(args):
                 align_corners=True
             )
             num_classes_big = out_big_upsampled.shape[1]
-            labels_big_one_hot = F.one_hot(labels_big_dice, num_classes=num_classes_big).permute(0, 3, 1, 2).float()
+            labels_big_one_hot = F.one_hot(labels_big_dice, num_classes_big).permute(0, 3, 1, 2).float()
             loss_big_dice = multiclass_dice_loss_big(out_big_upsampled, labels_big_one_hot)
             loss_big = dice_weight * loss_big_dice
             loss_big.backward()
             optimizer_big.step()
             train_losses_big.append(loss_big.item())
 
+        # Average training losses
         avg_loss_small = sum(train_losses_small) / len(train_losses_small)
         avg_loss_medium = sum(train_losses_medium) / len(train_losses_medium)
         avg_loss_big = sum(train_losses_big) / len(train_losses_big)
@@ -247,10 +261,12 @@ def main(args):
         val_losses_medium = []
         val_losses_big = []
 
+        # For confusion matrices
         num_classes_small = 8
         num_classes_medium = 5
         num_classes_big = 9
         num_classes_composed = 19
+
         conf_mat_small = torch.zeros(num_classes_small, num_classes_small, dtype=torch.int64)
         conf_mat_medium = torch.zeros(num_classes_medium, num_classes_medium, dtype=torch.int64)
         conf_mat_big = torch.zeros(num_classes_big, num_classes_big, dtype=torch.int64)
@@ -275,7 +291,7 @@ def main(args):
                 num_classes_small = out_small_upsampled.shape[1]
                 labels_small_dice = labels_small.clone()
                 labels_small_dice[labels_small_dice == 255] = 0
-                labels_small_one_hot = F.one_hot(labels_small_dice, num_classes=num_classes_small).permute(0, 3, 1, 2).float()
+                labels_small_one_hot = F.one_hot(labels_small_dice, num_classes_small).permute(0, 3, 1, 2).float()
                 loss_small_dice = multiclass_dice_loss_small(out_small_upsampled, labels_small_one_hot)
                 val_losses_small.append(loss_small_dice.item())
                 pred_small = out_small_upsampled.softmax(dim=1).argmax(dim=1)
@@ -293,7 +309,7 @@ def main(args):
                 num_classes_medium = out_medium_upsampled.shape[1]
                 labels_medium_dice = labels_medium.clone()
                 labels_medium_dice[labels_medium_dice == 255] = 0
-                labels_medium_one_hot = F.one_hot(labels_medium_dice, num_classes=num_classes_medium).permute(0, 3, 1, 2).float()
+                labels_medium_one_hot = F.one_hot(labels_medium_dice, num_classes_medium).permute(0, 3, 1, 2).float()
                 loss_medium_dice = multiclass_dice_loss_medium(out_medium_upsampled, labels_medium_one_hot)
                 val_losses_medium.append(loss_medium_dice.item())
                 pred_medium = out_medium_upsampled.softmax(dim=1).argmax(dim=1)
@@ -311,7 +327,7 @@ def main(args):
                 num_classes_big = out_big_upsampled.shape[1]
                 labels_big_dice = labels_big.clone()
                 labels_big_dice[labels_big_dice == 255] = 0
-                labels_big_one_hot = F.one_hot(labels_big_dice, num_classes=num_classes_big).permute(0, 3, 1, 2).float()
+                labels_big_one_hot = F.one_hot(labels_big_dice, num_classes_big).permute(0, 3, 1, 2).float()
                 loss_big_dice = multiclass_dice_loss_big(out_big_upsampled, labels_big_one_hot)
                 val_losses_big.append(loss_big_dice.item())
                 pred_big = out_big_upsampled.softmax(dim=1).argmax(dim=1)
@@ -323,43 +339,55 @@ def main(args):
                     bg_small=0, bg_medium=0, bg_big=0
                 )
                 ground_truth_full = labels_trainid.squeeze(1).to(device)
-                conf_mat_composed = update_confusion_matrix(conf_mat_composed, composed_pred, ground_truth_full, ignore_index=255)
+                conf_mat_composed = update_confusion_matrix(
+                    conf_mat_composed, composed_pred, ground_truth_full, ignore_index=255
+                )
 
+                # Log sample predictions (once per epoch) to W&B
                 if not logged_images:
                     decoded_small = decode_label_small(pred_small)
                     decoded_medium = decode_label_medium(pred_medium)
                     decoded_big = decode_label_big(pred_big)
+
                     composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
                     composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
                     pred_small_color = convert_train_id_to_color(decoded_small.unsqueeze(1))
                     pred_small_img = make_grid(pred_small_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
                     pred_medium_color = convert_train_id_to_color(decoded_medium.unsqueeze(1))
                     pred_medium_img = make_grid(pred_medium_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
                     pred_big_color = convert_train_id_to_color(decoded_big.unsqueeze(1))
                     pred_big_img = make_grid(pred_big_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
+
                     gt_color = convert_train_id_to_color(labels_trainid)
                     gt_img = make_grid(gt_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
+                    # Log images every 5 epochs, for instance
                     if epoch % 5 == 0:
                         wandb.log({
                             "val_small_prediction": [wandb.Image(pred_small_img)],
                             "val_medium_prediction": [wandb.Image(pred_medium_img)],
                             "val_big_prediction": [wandb.Image(pred_big_img)],
                             "val_composed_prediction": [wandb.Image(composed_pred_img)],
-                            "val_ground_truth": [wandb.Image(gt_img)]
+                            "val_ground_truth": [wandb.Image(gt_img)],
                         })
                     logged_images = True
 
+        # Compute validation losses
         avg_val_small = sum(val_losses_small) / len(val_losses_small) if val_losses_small else 0
         avg_val_medium = sum(val_losses_medium) / len(val_losses_medium) if val_losses_medium else 0
         avg_val_big = sum(val_losses_big) / len(val_losses_big) if val_losses_big else 0
         val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0
 
+        # Compute mIoU
         miou_small = compute_miou(conf_mat_small)
         miou_medium = compute_miou(conf_mat_medium)
         miou_big = compute_miou(conf_mat_big)
         miou_composed = compute_miou(conf_mat_composed)
 
+        # Log metrics
         wandb.log({
             "train_loss_small": avg_loss_small,
             "train_loss_medium": avg_loss_medium,
@@ -372,28 +400,12 @@ def main(args):
             "epoch": epoch + 1,
         })
 
+        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            checkpoint_name = f"best_models_epoch={epoch+1}_val={val_loss:.4f}.pth"
-            best_checkpoint_path = os.path.join("checkpoints", checkpoint_name)
-
-            torch.save({
-                "model_small": model_small.state_dict(),
-                "model_medium": model_medium.state_dict(),
-                "model_big": model_big.state_dict(),
-            }, best_checkpoint_path)
-
-            print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f}")
-            
-            print("-> Building single-file ensemble checkpoint...")
-            ensemble = EnsembleModel(device="cpu")
-            checkpoint_dict = torch.load(best_checkpoint_path, map_location="cpu")
-            ensemble.model_small.load_state_dict(checkpoint_dict["model_small"])
-            ensemble.model_medium.load_state_dict(checkpoint_dict["model_medium"])
-            ensemble.model_big.load_state_dict(checkpoint_dict["model_big"])
-            ensemble_path = os.path.join("checkpoints", f"best_ensemble_epoch={epoch+1}_val={val_loss:.4f}.pth")
-            torch.save(ensemble.state_dict(), ensemble_path)
-            print(f"-> Single-file ensemble saved: {ensemble_path}")
+            best_checkpoint_path = os.path.join("checkpoints", "model.pth")
+            torch.save(model.state_dict(), best_checkpoint_path)
+            print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f} -> {best_checkpoint_path}")
 
     wandb.finish()
     print("Training complete.")

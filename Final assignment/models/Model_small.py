@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from network.hrnet import hrnet48
+# from network.hrnet import hrnet48
 from unet import UNet
 
 def get_model(device, num_classes=19):
@@ -55,7 +55,7 @@ def decode_label_small(pred, ignore_index=255):
           5 -> 12   (rider)
           6 -> 17   (motorcycle)
           7 -> 18   (bicycle)
-        Background (0) remains 0, and pixels with ignore_index remain as ignore_index.
+        Background (0) remains as ignore_index.
     """
     # Initialize with ignore_index
     new_pred = torch.full_like(pred, ignore_index)
@@ -74,7 +74,7 @@ def decode_label_small(pred, ignore_index=255):
     for sub_id, city_id in class_mapping.items():
         new_pred[pred == sub_id] = city_id
 
-    # Background remains as 0
-    new_pred[pred == 0] = 0
+    # Remove or modify the following line to avoid resetting background:
+    # new_pred[pred == 0] = 0
 
     return new_pred
