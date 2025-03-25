@@ -165,8 +165,13 @@ def main(args):
     # We only use dice losses here
     dice_weight = 1.0
 
-    best_val_loss = float("inf")
-    best_checkpoint_path = None
+    # Track separate best losses for each submodel
+    best_val_loss_small = float("inf")
+    best_val_loss_medium = float("inf")
+    best_val_loss_big = float("inf")
+
+    # (Optional) Also track best combined loss if you still want that
+    best_val_loss_overall = float("inf")
 
     for epoch in range(args.epochs):
         print(f"Epoch [{epoch+1}/{args.epochs}]")
@@ -198,7 +203,7 @@ def main(args):
                 align_corners=True
             )
             num_classes_small = out_small_upsampled.shape[1]
-            labels_small_one_hot = F.one_hot(labels_small_dice, num_classes=num_classes_small).permute(0, 3, 1, 2).float()
+            labels_small_one_hot = F.one_hot(labels_small_dice, num_classes_small).permute(0, 3, 1, 2).float()
             loss_small_dice = multiclass_dice_loss_small(out_small_upsampled, labels_small_one_hot)
             loss_small = dice_weight * loss_small_dice
             loss_small.backward()
@@ -219,7 +224,7 @@ def main(args):
                 align_corners=True
             )
             num_classes_medium = out_medium_upsampled.shape[1]
-            labels_medium_one_hot = F.one_hot(labels_medium_dice, num_classes=num_classes_medium).permute(0, 3, 1, 2).float()
+            labels_medium_one_hot = F.one_hot(labels_medium_dice, num_classes_medium).permute(0, 3, 1, 2).float()
             loss_medium_dice = multiclass_dice_loss_medium(out_medium_upsampled, labels_medium_one_hot)
             loss_medium = dice_weight * loss_medium_dice
             loss_medium.backward()
@@ -349,6 +354,7 @@ def main(args):
                     decoded_medium = decode_label_medium(pred_medium)
                     decoded_big = decode_label_big(pred_big)
 
+                    from utils import convert_train_id_to_color
                     composed_pred_color = convert_train_id_to_color(composed_pred.unsqueeze(1))
                     composed_pred_img = make_grid(composed_pred_color.cpu(), nrow=4).permute(1, 2, 0).numpy()
 
@@ -379,6 +385,8 @@ def main(args):
         avg_val_small = sum(val_losses_small) / len(val_losses_small) if val_losses_small else 0
         avg_val_medium = sum(val_losses_medium) / len(val_losses_medium) if val_losses_medium else 0
         avg_val_big = sum(val_losses_big) / len(val_losses_big) if val_losses_big else 0
+
+        # Combined val loss
         val_loss = (avg_val_small + avg_val_medium + avg_val_big) / 3.0
 
         # Compute mIoU
@@ -393,6 +401,9 @@ def main(args):
             "train_loss_medium": avg_loss_medium,
             "train_loss_big": avg_loss_big,
             "val_loss": val_loss,
+            "val_loss_small": avg_val_small,
+            "val_loss_medium": avg_val_medium,
+            "val_loss_big": avg_val_big,
             "val_mIoU_small": miou_small,
             "val_mIoU_medium": miou_medium,
             "val_mIoU_big": miou_big,
@@ -400,12 +411,35 @@ def main(args):
             "epoch": epoch + 1,
         })
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_checkpoint_path = os.path.join("checkpoints", "model.pth")
+        # ------------------ SAVE BEST CHECKPOINTS ------------------
+        # Check if the SMALL model improved
+        if avg_val_small < best_val_loss_small:
+            best_val_loss_small = avg_val_small
+            checkpoint_path = os.path.join("checkpoints", f"best_model_small_epoch{epoch+1}.pth")
+            torch.save(model_small.state_dict(), checkpoint_path)
+            print(f"New best SMALL model saved at epoch {epoch+1} with val_loss_small={avg_val_small:.4f} -> {checkpoint_path}")
+
+        # Check if the MEDIUM model improved
+        if avg_val_medium < best_val_loss_medium:
+            best_val_loss_medium = avg_val_medium
+            checkpoint_path = os.path.join("checkpoints", f"best_model_medium_epoch{epoch+1}.pth")
+            torch.save(model_medium.state_dict(), checkpoint_path)
+            print(f"New best MEDIUM model saved at epoch {epoch+1} with val_loss_medium={avg_val_medium:.4f} -> {checkpoint_path}")
+
+        # Check if the BIG model improved
+        if avg_val_big < best_val_loss_big:
+            best_val_loss_big = avg_val_big
+            checkpoint_path = os.path.join("checkpoints", f"best_model_big_epoch{epoch+1}.pth")
+            torch.save(model_big.state_dict(), checkpoint_path)
+            print(f"New best BIG model saved at epoch {epoch+1} with val_loss_big={avg_val_big:.4f} -> {checkpoint_path}")
+
+        # (Optional) Also save a single “best overall” combined model
+        if val_loss < best_val_loss_overall:
+            best_val_loss_overall = val_loss
+            # This saves *all* submodels inside `model`
+            best_checkpoint_path = os.path.join("checkpoints", "best_model_overall.pth")
             torch.save(model.state_dict(), best_checkpoint_path)
-            print(f"New best model saved at epoch {epoch+1} with val_loss {val_loss:.4f} -> {best_checkpoint_path}")
+            print(f"New best OVERALL model saved at epoch {epoch+1} with avg_val_loss={val_loss:.4f} -> {best_checkpoint_path}")
 
     wandb.finish()
     print("Training complete.")
