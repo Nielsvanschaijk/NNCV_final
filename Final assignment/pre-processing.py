@@ -14,7 +14,7 @@ def preprocess(img):
     """
 
     # 1) Resize the image to the same size used in training
-    img_resized = TF.resize(img, (16, 16))  # <-- Adjust if trained on another size
+    img_resized = TF.resize(img, (512, 512))  # <-- Adjust if trained on another size
     
     # 2) Convert to a torch.FloatTensor (range [0,1])
     x = TF.to_tensor(img_resized)  # shape [3, H, W]

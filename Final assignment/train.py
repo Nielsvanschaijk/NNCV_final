@@ -126,12 +126,12 @@ def main(args):
         name=args.experiment_id,
         config=vars(args),
         reinit=True,
-    )
+    ) 
 
     # Define transforms
     transform = Compose([
         ToImage(),
-        Resize((16, 16)),  # You can adjust the resolution as needed
+        Resize((512, 512)),  # You can adjust the resolution as needed
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])

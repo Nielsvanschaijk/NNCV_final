@@ -46,16 +46,3 @@ def compose_predictions(pred_small, pred_medium, pred_big, bg_small=0, bg_medium
     final[final_bg_mask & (pred_big != bg_big)] = pred_big[final_bg_mask & (pred_big != bg_big)]
 
     return final
-
-import torch
-
-def compose_predictions(pred_small, pred_medium, pred_big, bg_small=0, bg_medium=0, bg_big=0):
-    """
-    Compose predictions from three submodels by performing majority voting.
-    Assumes each prediction is a tensor of shape [B, H, W].
-    """
-    # Stack predictions along a new dimension: [B, 3, H, W]
-    stacked_preds = torch.stack([pred_small, pred_medium, pred_big], dim=1)
-    # Use mode to compute the majority vote along the second dimension.
-    composed_pred, _ = torch.mode(stacked_preds, dim=1)
-    return composed_pred
