@@ -117,9 +117,9 @@ def main(args):
 
     transform = Compose([
         ToImage(),
-        Resize((16, 16)),  # Adjust resolution as needed
+        Resize((512, 1024)),  # Adjust resolution as needed
         ToDtype(torch.float32, scale=True),
-        Normalize((0.5,), (0.5,)),
+        Normalize((0.286, 0.325, 0.283), (0.176, 0.180, 0.177))
     ])
 
     train_dataset = Cityscapes(args.data_dir, split="train", mode="fine", target_type="semantic", transforms=transform)
