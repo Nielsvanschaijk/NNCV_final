@@ -131,7 +131,7 @@ def main(args):
     # Define transforms
     transform = Compose([
         ToImage(),
-        Resize((512, 512)),  # You can adjust the resolution as needed
+        Resize((16, 16)),  # You can adjust the resolution as needed
         ToDtype(torch.float32, scale=True),
         Normalize((0.5,), (0.5,)),
     ])
@@ -157,7 +157,9 @@ def main(args):
     model_big = model.model_big
 
     # Define optimizers for each submodel
-    optimizer_small = AdamW(model_small.parameters(), lr=args.lr)
+    # optimizer_small = AdamW(model_small.parameters(), lr=args.lr)
+    optimizer_small = AdamW(filter(lambda p: p.requires_grad, model_small.parameters()), lr=args.lr)
+
     optimizer_medium = AdamW(model_medium.parameters(), lr=args.lr)
     optimizer_big = AdamW(model_big.parameters(), lr=args.lr)
 
