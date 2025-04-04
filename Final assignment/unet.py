@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 
 class UNet(nn.Module):
     """ 
@@ -101,3 +102,25 @@ class OutConv(nn.Module):
 
     def forward(self, x):
         return self.conv(x)
+
+def get_model_size_and_params(model):
+    # Count total parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Save temporarily to get file size
+    temp_path = "temp_unet.pth"
+    torch.save(model.state_dict(), temp_path)
+    size_kb = os.path.getsize(temp_path) / 1024.0
+    os.remove(temp_path)
+    
+    return total_params, size_kb
+
+# Instantiate model
+model = UNet(in_channels=3, num_classes=1)
+
+# Get stats
+params, size_kb = get_model_size_and_params(model)
+
+# Print them
+print(f"UNet model parameters: {params:,}")
+print(f"Model size (KB): {size_kb:.2f}")

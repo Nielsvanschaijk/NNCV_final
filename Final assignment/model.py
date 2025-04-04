@@ -1,106 +1,110 @@
-# model.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-# Make sure these are the same references used in train.py:
-from models.Model_small import get_model as get_small_model
-from models.Model_medium import get_model as get_medium_model
-from models.Model_big import get_model as get_big_model
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None):
+        super().__init__()
+        if not mid_channels:
+            mid_channels = out_channels
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
 
-import torch
-from torchvision.datasets import Cityscapes
-from torchvision.utils import make_grid
+    def forward(self, x):
+        return self.double_conv(x)
 
-# Convert raw Cityscapes "ID" labels to "train IDs" (0..18 or 255 for ignore).
-id_to_trainid = {cls.id: cls.train_id for cls in Cityscapes.classes}
-def convert_to_train_id(label_img: torch.Tensor) -> torch.Tensor:
-    return label_img.apply_(lambda x: id_to_trainid[x])
 
-# Dictionary to map train IDs -> colors for visualization.
-train_id_to_color = {cls.train_id: cls.color for cls in Cityscapes.classes if cls.train_id != 255}
-train_id_to_color[255] = (0, 0, 0)  # Black for ignored labels
+class Down(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
 
-def convert_train_id_to_color(prediction: torch.Tensor) -> torch.Tensor:
-    """
-    Convert a prediction mask (B x 1 x H x W) of train IDs into a color image (B x 3 x H x W).
-    """
-    batch, _, height, width = prediction.shape
-    color_image = torch.zeros((batch, 3, height, width), dtype=torch.uint8)
-    for train_id, color in train_id_to_color.items():
-        mask = prediction[:, 0] == train_id
-        for i in range(3):
-            color_image[:, i][mask] = color[i]
-    return color_image
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
-def compose_predictions(pred_small, pred_medium, pred_big, bg_small=0, bg_medium=0, bg_big=0):
-    """
-    Overwrite logic: 
-    1) If small != bg_small, use small’s class.
-    2) Else if medium != bg_medium, use medium’s class.
-    3) Else if big != bg_big, use big’s class.
-    Otherwise remain background.
-    """
-    # Start from small’s predictions
-    final = pred_small.clone()
 
-    # Where small is background, try medium
-    small_bg_mask = (pred_small == bg_small)
-    # Overwrite only where medium is non-bg
-    final[small_bg_mask & (pred_medium != bg_medium)] = pred_medium[small_bg_mask & (pred_medium != bg_medium)]
+class Up(nn.Module):
+    def __init__(self, in_channels, out_channels, bilinear=True):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
 
-    # Where final is still background, try big
-    final_bg_mask = (final == bg_small)
-    final[final_bg_mask & (pred_big != bg_big)] = pred_big[final_bg_mask & (pred_big != bg_big)]
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
 
-    return final
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
 
 
 class Model(nn.Module):
     """
-    A single PyTorch model that contains the small, medium, and big submodels.
-    It returns a single final segmentation map of shape [B, H, W],
-    where each pixel is a training ID.
-
-    If you need out-of-distribution detection:
-      - Add an extra head and return (segmentation, classification).
+    Multi-head UNet model (used in training).
+    Codalab will import this class and call forward(x), which must return a single output.
+    So we return the output of one head — e.g., small head.
     """
-
-    def __init__(self):
+    def __init__(self, in_channels=3):
         super().__init__()
-        # Instantiate each submodel on CPU by default
-        self.model_small = get_small_model(device="cpu")    # 8 classes (0..7)
-        self.model_medium = get_medium_model(device="cpu")  # 5 classes (0..4)
-        self.model_big = get_big_model(device="cpu")        # 9 classes (0..8)
+        self.inc   = DoubleConv(in_channels, 64)
+        self.down1 = Down(64, 128)
+        self.down2 = Down(128, 256)
+        self.down3 = Down(256, 512)
+        self.down4 = Down(512, 512)
+
+        # Small head (8 classes)
+        self.up1_small = Up(1024, 256)
+        self.up2_small = Up(512, 128)
+        self.up3_small = Up(256, 64)
+        self.up4_small = Up(128, 64)
+        self.outc_small = OutConv(64, 8)
+
+        # Medium head (5 classes) — not used in forward
+        self.up1_medium = Up(1024, 256)
+        self.up2_medium = Up(512, 128)
+        self.up3_medium = Up(256, 64)
+        self.up4_medium = Up(128, 64)
+        self.outc_medium = OutConv(64, 5)
+
+        # Big head (9 classes) — not used in forward
+        self.up1_big = Up(1024, 256)
+        self.up2_big = Up(512, 128)
+        self.up3_big = Up(256, 64)
+        self.up4_big = Up(128, 64)
+        self.outc_big = OutConv(64, 9)
 
     def forward(self, x):
-        """
-        Inputs:
-            x: a Tensor of shape [B, 3, H, W] (RGB image).
-        Returns:
-            A final segmentation map of shape [B, H, W],
-            where each pixel is an integer training ID (0..18, or 255 for ignore).
-        """
-        # Get raw logits from each submodel
-        out_small = self.model_small(x)   # [B, 8, H, W]
-        out_medium = self.model_medium(x) # [B, 5, H, W]
-        out_big = self.model_big(x)       # [B, 9, H, W]
+        # Shared encoder
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
 
-        # Argmax each submodel's logits to get predicted class per pixel
-        pred_small = out_small.argmax(dim=1)     # [B, H, W], classes in {0..7}
-        pred_medium = out_medium.argmax(dim=1)   # [B, H, W], classes in {0..4}
-        pred_big = out_big.argmax(dim=1)         # [B, H, W], classes in {0..8}
+        # Use SMALL head only for output (matches model checkpoint!)
+        xs = self.up1_small(x5, x4)
+        xs = self.up2_small(xs, x3)
+        xs = self.up3_small(xs, x2)
+        xs = self.up4_small(xs, x1)
+        out = self.outc_small(xs)
 
-        # Compose them into a single segmentation map with Cityscapes train IDs
-        # The arguments bg_small=0, bg_medium=0, bg_big=0 indicate the "background" ID in each submodel
-        composed_pred = compose_predictions(
-            pred_small,
-            pred_medium,
-            pred_big,
-            bg_small=0, 
-            bg_medium=0, 
-            bg_big=0
-        )
-        # shape: [B, H, W], values typically in {0..18, 255 for ignore}
-
-        return composed_pred
-    
+        return out  # shape [B, 8, H, W]

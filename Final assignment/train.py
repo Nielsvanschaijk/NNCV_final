@@ -44,6 +44,28 @@ from utils import (
 
 from argparse import ArgumentParser
 
+def get_stats_per_model(model_small, model_medium, model_big):
+    models = {
+        "small": model_small,
+        "medium": model_medium,
+        "big": model_big
+    }
+
+    stats = {}
+
+    for name, m in models.items():
+        param_count = sum(p.numel() for p in m.parameters())
+        tmp_path = f"temp_{name}.pth"
+        torch.save(m.state_dict(), tmp_path)
+        size_kb = os.path.getsize(tmp_path) / 1024.0
+        os.remove(tmp_path)
+        stats[name] = {
+            "params": param_count,
+            "size_kb": size_kb
+        }
+
+    return stats
+
 class Model(nn.Module):
     """
     A single PyTorch model that contains the small, medium, and big submodels.
@@ -134,7 +156,11 @@ def main(args):
 
     model = Model()
     model.to(device)
+    stats = get_stats_per_model(model.model_small, model.model_medium, model.model_big)
 
+    print("\nModel stats per submodel:")
+    for name, stat in stats.items():
+        print(f"  {name} model: {stat['params']:,} parameters, {stat['size_kb']:.2f} KB")
     # Separate references to each submodel
     model_small = model.model_small
     model_medium = model.model_medium
